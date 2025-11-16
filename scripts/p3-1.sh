@@ -46,13 +46,13 @@ while true; do
         continue
     fi
 
-    # ---------- ЦИКЛ ВЫБОРА ГРУППЫ ----------
+  
     while true; do
         echo
         echo "Предмет: $SUBJECT"
         read -rp "Введите группу (например A-06-04/Ae-21-22, 0 — сменить предмет/выход; Ввод на англ-ом): " GROUP
 
-        # 0 — вернуться к выбору предмета
+       
         if [ "$GROUP" = "0" ]; then
             echo "Возврат к выбору предмета..."
             break
@@ -63,30 +63,54 @@ while true; do
             continue
         fi
 
-        # для сравнения внутри awk делаем верхний регистр
         GROUP_UPPER=$(echo "$GROUP" | tr '[:lower:]' '[:upper:]')
 
-        # --- ПРОВЕРКА КОРРЕКТНОСТИ ВВОДА ГРУППЫ ---
-        # ищем, есть ли такая группа хотя бы в одном файле TEST-*
-        if ! awk -v grp="$GROUP_UPPER" -F';' '
-            BEGIN { grp_upper = toupper(grp); found = 0 }
-            {
-                # первое поле — группа
-                if (toupper($1) == grp_upper) { found = 1; exit }
-            }
-            END { exit (found ? 0 : 1) }
-        ' "$TESTS_DIR"/TEST-* 2>/dev/null; then
-            echo "Ошибка: группа $GROUP_UPPER не найдена в файлах тестов предмета."
-            echo "Проверьте правильность ввода и попробуйте ещё раз."
+        ATT_FILE="$SUBJECT_DIR/${GROUP_UPPER}-attendance"
+
+        if [ ! -f "$ATT_FILE" ]; then
+            echo "Ошибка: не найден файл посещаемости для группы $GROUP_UPPER:"
+            echo "       $ATT_FILE"
+            echo "Проверьте название группы и попробуйте ещё раз."
             continue
         fi
 
-       
+        # Узнаём количество лекций (длина строки из 0/1)
+        MAX_LECTURES=$(awk 'NR==1 { print length($2); exit }' "$ATT_FILE")
+        if [ -z "$MAX_LECTURES" ]; then
+            echo "Ошибка: файл посещаемости пуст или имеет неверный формат."
+            continue
+        fi
+
+        echo "Для группы $GROUP_UPPER найдено занятий: $MAX_LECTURES"
+
+      
         while true; do
             echo
             echo "Предмет: $SUBJECT, группа: $GROUP_UPPER"
             echo "0 — выбрать другую группу"
-            read -rp "Введите номер теста: " TEST_NO
+            read -rp "Введите номер лекции N (1..$MAX_LECTURES): " LEC_NO
+
+            if [ "$LEC_NO" = "0" ]; then
+                echo "Возврат к выбору группы..."
+                break
+            fi
+
+            if [ -z "$LEC_NO" ]; then
+                echo "Номер лекции не может быть пустым."
+                continue
+            fi
+
+            if ! [[ "$LEC_NO" =~ ^[0-9]+$ ]]; then
+                echo "Номер лекции должен быть целым числом."
+                continue
+            fi
+
+            if [ "$LEC_NO" -lt 1 ] || [ "$LEC_NO" -gt "$MAX_LECTURES" ]; then
+                echo "Номер лекции должен быть от 1 до $MAX_LECTURES."
+                continue
+            fi
+
+            read -rp "Введите номер теста K (0 — выбрать другую группу): " TEST_NO
 
             if [ "$TEST_NO" = "0" ]; then
                 echo "Возврат к выбору группы..."
@@ -113,67 +137,53 @@ while true; do
             fi
 
             echo
-            echo "=== Предмет: $SUBJECT, группа: $GROUP_UPPER, тест: $TEST_NO ==="
-            echo "Поиск студентов, которые написали тест только на 2 или вообще без оценки..."
+            echo "=== Предмет: $SUBJECT, группа: $GROUP_UPPER, лекция N=$LEC_NO, тест K=$TEST_NO ==="
+            echo "Поиск студентов, пропустивших лекцию и сдавших тест на 5..."
 
-          
-            awk -v grp="$GROUP_UPPER" '
+           
+            awk -v grp="$GROUP_UPPER" -v lec="$LEC_NO" -v testno="$TEST_NO" '
             BEGIN {
                 grp_upper = toupper(grp)
             }
+            NR==FNR {
+                # Первый файл — посещаемость: отмечаем, кто ПРОПУСТИЛ лекцию lec
+                login = $1
+                bits  = $2
+                if (lec <= length(bits)) {
+                    b = substr(bits, lec, 1)
+                    if (b == "0") {
+                        missed[login] = 1
+                    }
+                }
+                next
+            }
             {
-                # Разбиваем строку по ;
+                # Второй файл — TEST-K
                 split($0, f, ";")
                 if (length(f) < 5) next
 
-                # Фильтруем строки по группе без учёта регистра
+                # Группа должна совпадать (без учёта регистра)
                 if (toupper(f[1]) != grp_upper) next
 
                 login = f[2]
 
-                # Сырой текст оценки (может быть пустой, "2", "2-", "5+", "4--" и т.п.)
-                raw = f[5]
-
-                # Если столбец с оценкой пустой (или только пробелы) —
-                # считаем, что у этого студента пока НЕТ оценки
-                tmp = raw
-                gsub(/[[:space:]]/, "", tmp)
-                if (tmp == "") {
-                    no_grade[login] = 1
-                    any[login] = 1
-                    next
-                }
-
-                # Выдираем цифры из поля оценки
-                grade_str = raw
+                # Оценка может быть "5", "5+", "5--" и т.п.
+                grade_str = f[5]
                 gsub(/[^0-9]/, "", grade_str)
-
-                # Если цифр нет (какая-то странная запись) — просто считаем,
-                # что студент "есть", но оценки не учитываем
-                if (grade_str == "") {
-                    any[login] = 1
-                    next
-                }
-
+                if (grade_str == "") next
                 grade = grade_str + 0
 
-                # Запоминаем ЛУЧШУЮ оценку по этому тесту для каждого студента
-                if (!(login in best) || grade > best[login]) {
-                    best[login] = grade
+                # Запоминаем ЛУЧШУЮ оценку по этому тесту
+                if (!(login in best_grade) || grade > best_grade[login]) {
+                    best_grade[login] = grade
                 }
-                any[login] = 1
+                seen[login] = 1
             }
             END {
                 found = 0
-                print "Студенты группы " grp " с лучшей оценкой 2 или без оценки по этому тесту:"
-                for (login in any) {
-                    # вариант 1: есть числовая оценка, и лучшая = 2
-                    if ((login in best) && best[login] == 2) {
-                        print "  " login
-                        found = 1
-                    }
-                    # вариант 2: ни одной числовой оценки, хотя записи есть (пустой 5-й столбец)
-                    else if (!(login in best)) {
+                print "Студенты группы " grp " пропустившие лекцию " lec " и сдавшие тест " testno " на 5:"
+                for (login in missed) {
+                    if (login in best_grade && best_grade[login] == 5) {
                         print "  " login
                         found = 1
                     }
@@ -182,12 +192,11 @@ while true; do
                     print "Таких студентов не найдено"
                 }
             }
-            ' "$TEST_FILE"
-
+            ' "$ATT_FILE" "$TEST_FILE"
 
             echo
-            echo "Можешь ввести другой номер теста для этой группы,"
-            echo "или 0 — чтобы выбрать другую группу."
+            echo "Можешь ввести другие N и K для этой же группы,"
+            echo "или 0 при вводе N/K — чтобы выбрать другую группу."
         done
     done
 done
